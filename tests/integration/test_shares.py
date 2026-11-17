@@ -154,3 +154,122 @@ async def test_save_to_history(auth_client: Any, db: Any) -> None:
 async def test_anonymous_ignores_save_to_history(client: Any, db: Any) -> None:
     assert (await create(client, save_to_history=True)).status_code == 201
     assert (await db.execute(select(HistoryEntry))).first() is None
+
+
+# ----------------------------------------------------------- password / burn-after-read / comments
+
+
+async def test_password_protected_share(client: Any) -> None:
+    created = (await create(client, password="s3cret!")).json()
+    slug = created["slug"]
+    meta = (await client.get(f"/api/shares/{slug}/meta")).json()
+    assert meta["password_protected"] is True and meta["burn_after_read"] is False
+    assert "content" not in meta
+    locked = await client.get(f"/api/shares/{slug}")
+    assert locked.status_code == 403 and locked.json()["error"]["code"] == "share_locked"
+    no_pw = await client.post(f"/api/shares/{slug}/open", json={})
+    assert no_pw.status_code == 403 and no_pw.json()["error"]["code"] == "password_required"
+    wrong = await client.post(f"/api/shares/{slug}/open", json={"password": "nope-nope"})
+    assert wrong.status_code == 403 and wrong.json()["error"]["code"] == "invalid_password"
+    ok = await client.post(f"/api/shares/{slug}/open", json={"password": "s3cret!"})
+    assert ok.status_code == 200
+    assert ok.json()["content"] == '{"a": 1}' and ok.json()["password_protected"] is True
+
+
+async def test_password_is_hashed_and_validated(client: Any, db: Any) -> None:
+    short = await create(client, password="abc")
+    assert short.status_code == 422
+    await create(client, password="longenough")
+    row = (await db.execute(select(Share))).scalar_one()
+    assert row.password_hash and row.password_hash.startswith("scrypt$")
+    assert "longenough" not in row.password_hash
+
+
+async def test_burn_after_read_is_destroyed_after_one_open(client: Any, db: Any) -> None:
+    slug = (await create(client, burn_after_read=True)).json()["slug"]
+    # describing it (e.g. a link preview bot) does not burn it
+    meta = (await client.get(f"/api/shares/{slug}/meta")).json()
+    assert meta["burn_after_read"] is True
+    assert (await client.get(f"/api/shares/{slug}")).status_code == 403
+    assert (await db.execute(select(Share))).scalar_one()
+    first = await client.post(f"/api/shares/{slug}/open", json={})
+    assert first.status_code == 200 and first.json()["content"] == '{"a": 1}'
+    second = await client.post(f"/api/shares/{slug}/open", json={})
+    assert second.status_code == 404
+    assert (await client.get(f"/api/shares/{slug}/meta")).status_code == 404
+
+
+async def test_burn_with_wrong_password_is_not_burned(client: Any) -> None:
+    slug = (await create(client, burn_after_read=True, password="correct-horse")).json()["slug"]
+    bad = await client.post(f"/api/shares/{slug}/open", json={"password": "wrong-horse"})
+    assert bad.status_code == 403
+    good = await client.post(f"/api/shares/{slug}/open", json={"password": "correct-horse"})
+    assert good.status_code == 200
+
+
+async def test_open_works_for_normal_shares_too(client: Any) -> None:
+    slug = (await create(client)).json()["slug"]
+    r = await client.post(f"/api/shares/{slug}/open", json={})
+    assert r.status_code == 200 and r.json()["view_count"] == 1
+    assert (await client.get(f"/api/shares/{slug}")).status_code == 200
+
+
+async def test_comments_lifecycle(client: Any) -> None:
+    created = (await create(client, comments_enabled=True)).json()
+    slug, token = created["slug"], created["delete_token"]
+    assert (await client.get(f"/api/shares/{slug}/meta")).json()["comments_enabled"] is True
+    assert (await client.get(f"/api/shares/{slug}/comments")).json() == []
+    c = await client.post(
+        f"/api/shares/{slug}/comments",
+        json={"text": "Why 1?", "author": "Ann", "path": "$.a"},
+    )
+    assert c.status_code == 201
+    cid = c.json()["id"]
+    assert c.json()["path"] == "$.a" and c.json()["author"] == "Ann"
+    listed = (await client.get(f"/api/shares/{slug}/comments")).json()
+    assert [x["text"] for x in listed] == ["Why 1?"]
+    # strangers cannot delete, the delete-token holder can
+    assert (await client.delete(f"/api/shares/{slug}/comments/{cid}")).status_code == 403
+    ok = await client.delete(
+        f"/api/shares/{slug}/comments/{cid}", headers={"X-Delete-Token": token}
+    )
+    assert ok.status_code == 204
+    assert (await client.get(f"/api/shares/{slug}/comments")).json() == []
+
+
+async def test_comments_disabled_by_default_and_validated(client: Any) -> None:
+    slug = (await create(client)).json()["slug"]
+    r = await client.post(f"/api/shares/{slug}/comments", json={"text": "x", "author": "a"})
+    assert r.status_code == 403 and r.json()["error"]["code"] == "comments_disabled"
+    on = (await create(client, comments_enabled=True)).json()["slug"]
+    assert (
+        await client.post(f"/api/shares/{on}/comments", json={"text": "", "author": "a"})
+    ).status_code == 422
+    big = await client.post(f"/api/shares/{on}/comments", json={"text": "x" * 2001, "author": "a"})
+    assert big.status_code == 422
+
+
+async def test_comments_respect_the_password(client: Any) -> None:
+    slug = (await create(client, comments_enabled=True, password="hunter22")).json()["slug"]
+    body = {"text": "hi", "author": "a"}
+    assert (await client.get(f"/api/shares/{slug}/comments")).status_code == 403
+    assert (await client.post(f"/api/shares/{slug}/comments", json=body)).status_code == 403
+    h = {"X-Share-Password": "hunter22"}
+    assert (
+        await client.post(f"/api/shares/{slug}/comments", json=body, headers=h)
+    ).status_code == 201
+    assert len((await client.get(f"/api/shares/{slug}/comments", headers=h)).json()) == 1
+
+
+async def test_comments_are_removed_with_the_share(client: Any, db: Any) -> None:
+    from app.db.models import ShareComment
+
+    created = (await create(client, comments_enabled=True)).json()
+    slug = created["slug"]
+    await client.post(f"/api/shares/{slug}/comments", json={"text": "x", "author": "a"})
+    assert (await db.execute(select(ShareComment))).scalars().all()
+    d = await client.delete(
+        f"/api/shares/{slug}", headers={"X-Delete-Token": created["delete_token"]}
+    )
+    assert d.status_code == 204
+    assert not (await db.execute(select(ShareComment))).scalars().all()

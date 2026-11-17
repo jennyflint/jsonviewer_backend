@@ -161,11 +161,19 @@ def create_app(settings: Settings | None = None) -> Litestar:
             allow_origins=settings.cors_origin_list,
             allow_credentials=True,
             allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
-            allow_headers=["Content-Type", "X-CSRF-Token", "X-Delete-Token", "X-Request-ID"],
+            allow_headers=[
+                "Content-Type",
+                "X-CSRF-Token",
+                "X-Delete-Token",
+                "X-Request-ID",
+                "X-Share-Password",
+            ],
         ),
         exception_handlers=EXCEPTION_HANDLERS,
         openapi_config=openapi_config,
-        request_max_body_size=settings.max_fetch_bytes + 1024 * 1024,
+        # JSON-escaped documents can be up to ~2x their size; a comparison carries two of them
+        request_max_body_size=max(settings.max_fetch_bytes, settings.max_document_bytes * 2)
+        + 1024 * 1024,
         stores=stores or None,
         before_send=[add_security_headers],
         lifespan=[lifespan],

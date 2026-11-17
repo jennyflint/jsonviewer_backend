@@ -234,7 +234,7 @@ async def test_validation_error_details(client: Any) -> None:
 
 
 async def test_request_body_limit(new_client: Any) -> None:
-    async with new_client(max_fetch_bytes=1000) as c:
+    async with new_client(max_fetch_bytes=1000, max_document_bytes=1000) as c:
         resp = await c.post(
             "/api/analysis/validate",
             content=b'{"content":"' + b"x" * (1024 * 1024 + 2000) + b'"}',

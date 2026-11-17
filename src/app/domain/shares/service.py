@@ -4,24 +4,33 @@ import hmac
 import uuid
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import func, select, update
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings
-from app.db.models import HistorySource, Share, ShareKind, User
+from app.db.models import HistorySource, Share, ShareComment, ShareKind, User
 from app.domain.history.service import HistoryService
 from app.domain.shares.repository import ShareRepository
 from app.domain.shares.schemas import (
+    CommentOut,
+    CreateCommentRequest,
     CreateShareRequest,
     ShareCreated,
     ShareDetail,
     ShareListItem,
+    ShareMeta,
     SharePage,
 )
-from app.lib.errors import NotFound, PermissionDenied, Unprocessable
+from app.lib.errors import Conflict, NotFound, PermissionDenied, Unprocessable
 from app.lib.json_utils import make_preview, prepare_content
-from app.lib.security import generate_slug, random_token, token_hash
+from app.lib.security import (
+    generate_slug,
+    hash_password,
+    random_token,
+    token_hash,
+    verify_password,
+)
 
 EXPIRES = {
     "1h": timedelta(hours=1),
@@ -30,6 +39,7 @@ EXPIRES = {
     "30d": timedelta(days=30),
 }
 SLUG_ATTEMPTS = 5
+MAX_COMMENTS_PER_SHARE = 200
 
 
 def not_found() -> NotFound:
@@ -93,6 +103,9 @@ class ShareService:
                 owner_id=user.id if user else None,
                 delete_token_hash=delete_hash,
                 expires_at=expires_at,
+                password_hash=hash_password(data.password) if data.password else None,
+                burn_after_read=data.burn_after_read,
+                comments_enabled=data.comments_enabled,
             )
             try:
                 async with self.db.begin_nested():
@@ -124,18 +137,8 @@ class ShareService:
             delete_token=delete_token,
         )
 
-    async def view(self, slug: str, user: User | None) -> ShareDetail:
-        now = datetime.now(UTC)
-        stmt = (
-            update(Share)
-            .where(Share.slug == slug, _not_expired(now))
-            .values(view_count=Share.view_count + 1, last_viewed_at=now)
-            .returning(Share)
-            .execution_options(synchronize_session=False)
-        )
-        share = (await self.db.execute(stmt)).scalar_one_or_none()
-        if share is None:
-            raise not_found()
+    @staticmethod
+    def _detail(share: Share, user: User | None) -> ShareDetail:
         return ShareDetail(
             slug=share.slug,
             kind=share.kind.value,
@@ -147,7 +150,158 @@ class ShareService:
             expires_at=share.expires_at,
             view_count=share.view_count,
             is_owner=bool(user and share.owner_id == user.id),
+            comments_enabled=share.comments_enabled,
+            password_protected=share.password_hash is not None,
+            burn_after_read=share.burn_after_read,
         )
+
+    async def _get(self, slug: str) -> Share:
+        share = (
+            await self.db.execute(
+                select(Share).where(Share.slug == slug, _not_expired(datetime.now(UTC)))
+            )
+        ).scalar_one_or_none()
+        if share is None:
+            raise not_found()
+        return share
+
+    @staticmethod
+    def _check_password(share: Share, password: str | None) -> None:
+        if share.password_hash is None:
+            return
+        if not password:
+            raise PermissionDenied("This share is password protected.", code="password_required")
+        if not verify_password(password, share.password_hash):
+            raise PermissionDenied("Wrong password.", code="invalid_password")
+
+    async def meta(self, slug: str) -> ShareMeta:
+        share = await self._get(slug)
+        return ShareMeta(
+            slug=share.slug,
+            kind=share.kind.value,
+            title=share.title,
+            created_at=share.created_at,
+            expires_at=share.expires_at,
+            password_protected=share.password_hash is not None,
+            burn_after_read=share.burn_after_read,
+            comments_enabled=share.comments_enabled,
+        )
+
+    async def view(self, slug: str, user: User | None) -> ShareDetail:
+        """Plain read. Locked shares (password / burn-after-read) must go through ``open``."""
+        now = datetime.now(UTC)
+        share = await self._get(slug)
+        if share.password_hash is not None or share.burn_after_read:
+            raise PermissionDenied(
+                "This share must be opened explicitly (password or one-time link).",
+                code="share_locked",
+            )
+        stmt = (
+            update(Share)
+            .where(Share.id == share.id)
+            .values(view_count=Share.view_count + 1, last_viewed_at=now)
+            .returning(Share)
+            .execution_options(synchronize_session=False)
+        )
+        await self.db.execute(stmt)
+        await self.db.refresh(share)  # the row was loaded earlier: pick up the new view_count
+        return self._detail(share, user)
+
+    async def open(self, slug: str, password: str | None, user: User | None) -> ShareDetail:
+        """Read a share, checking its password; one-time links are destroyed after this read."""
+        share = await self._get(slug)
+        self._check_password(share, password)
+        now = datetime.now(UTC)
+        if share.burn_after_read:
+            detail = self._detail(share, user)
+            detail.view_count += 1
+            # delete atomically: a concurrent second reader finds nothing
+            deleted = (
+                await self.db.execute(delete(Share).where(Share.id == share.id).returning(Share.id))
+            ).scalar_one_or_none()
+            if deleted is None:
+                raise not_found()
+            return detail
+        stmt = (
+            update(Share)
+            .where(Share.id == share.id)
+            .values(view_count=Share.view_count + 1, last_viewed_at=now)
+            .returning(Share)
+            .execution_options(synchronize_session=False)
+        )
+        await self.db.execute(stmt)
+        await self.db.refresh(share)
+        return self._detail(share, user)
+
+    # ----------------------------------------------------------------- comments
+
+    @staticmethod
+    def _comment_out(c: ShareComment) -> CommentOut:
+        return CommentOut(
+            id=str(c.id), path=c.path, author=c.author, text=c.text, created_at=c.created_at
+        )
+
+    async def list_comments(self, slug: str, password: str | None) -> list[CommentOut]:
+        share = await self._get(slug)
+        self._check_password(share, password)
+        rows = (
+            await self.db.execute(
+                select(ShareComment)
+                .where(ShareComment.share_id == share.id)
+                .order_by(ShareComment.created_at, ShareComment.id)
+            )
+        ).scalars()
+        return [self._comment_out(c) for c in rows]
+
+    async def add_comment(
+        self, slug: str, data: CreateCommentRequest, password: str | None
+    ) -> CommentOut:
+        share = await self._get(slug)
+        self._check_password(share, password)
+        if not share.comments_enabled:
+            raise PermissionDenied(
+                "Comments are disabled for this share.", code="comments_disabled"
+            )
+        count = (
+            await self.db.execute(
+                select(func.count())
+                .select_from(ShareComment)
+                .where(ShareComment.share_id == share.id)
+            )
+        ).scalar_one()
+        if count >= MAX_COMMENTS_PER_SHARE:
+            raise Conflict("Too many comments on this share.", code="too_many_comments")
+        comment = ShareComment(
+            share_id=share.id,
+            path=data.path or None,
+            author=data.author.strip(),
+            text=data.text.strip(),
+        )
+        self.db.add(comment)
+        await self.db.flush()
+        await self.db.refresh(comment)
+        return self._comment_out(comment)
+
+    async def delete_comment(
+        self, slug: str, comment_id: uuid.UUID, user: User | None, delete_token: str | None
+    ) -> None:
+        share = await self._get(slug)
+        allowed = bool(user and share.owner_id is not None and share.owner_id == user.id)
+        if not allowed and delete_token and share.delete_token_hash:
+            allowed = hmac.compare_digest(share.delete_token_hash, token_hash(delete_token))
+        if not allowed:
+            raise PermissionDenied()
+        comment = (
+            await self.db.execute(
+                select(ShareComment).where(
+                    ShareComment.id == comment_id, ShareComment.share_id == share.id
+                )
+            )
+        ).scalar_one_or_none()
+        if comment is None:
+            raise NotFound("Comment not found.", code="comment_not_found")
+        await self.db.delete(comment)
+        await self.db.flush()
 
     async def delete(self, slug: str, user: User | None, delete_token: str | None) -> None:
         now = datetime.now(UTC)

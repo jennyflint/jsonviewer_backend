@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import uuid
 from typing import Annotated
 
 from litestar import Controller, delete, get, post
@@ -10,7 +11,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import Settings
 from app.db.models import User
 from app.domain.auth.guards import provide_required_user, requires_auth
-from app.domain.shares.schemas import CreateShareRequest, ShareCreated, ShareDetail, SharePage
+from app.domain.shares.schemas import (
+    CommentOut,
+    CreateCommentRequest,
+    CreateShareRequest,
+    OpenShareRequest,
+    ShareCreated,
+    ShareDetail,
+    ShareMeta,
+    SharePage,
+)
 from app.domain.shares.service import ShareService
 
 
@@ -37,6 +47,60 @@ class ShareController(Controller):
         self, slug: str, service: ShareService, current_user: User | None
     ) -> ShareDetail:
         return await service.view(slug, current_user)
+
+    @get("/{slug:str}/meta", summary="Describe a share without consuming it")
+    async def share_meta(self, slug: str, service: ShareService) -> ShareMeta:
+        return await service.meta(slug)
+
+    @post(
+        "/{slug:str}/open",
+        summary="Open a locked share (password / one-time link)",
+        status_code=200,
+    )
+    async def open_share(
+        self,
+        slug: str,
+        data: OpenShareRequest,
+        service: ShareService,
+        current_user: User | None,
+    ) -> ShareDetail:
+        return await service.open(slug, data.password, current_user)
+
+    @get("/{slug:str}/comments", summary="List comments of a share")
+    async def list_comments(
+        self,
+        slug: str,
+        service: ShareService,
+        password: Annotated[
+            str | None, Parameter(header="X-Share-Password", required=False)
+        ] = None,
+    ) -> list[CommentOut]:
+        return await service.list_comments(slug, password)
+
+    @post("/{slug:str}/comments", summary="Add a comment to a share", status_code=201)
+    async def add_comment(
+        self,
+        slug: str,
+        data: CreateCommentRequest,
+        service: ShareService,
+        password: Annotated[
+            str | None, Parameter(header="X-Share-Password", required=False)
+        ] = None,
+    ) -> CommentOut:
+        return await service.add_comment(slug, data, password)
+
+    @delete("/{slug:str}/comments/{comment_id:uuid}", summary="Delete a comment", status_code=204)
+    async def delete_comment(
+        self,
+        slug: str,
+        comment_id: uuid.UUID,
+        service: ShareService,
+        current_user: User | None,
+        delete_token: Annotated[
+            str | None, Parameter(header="X-Delete-Token", required=False)
+        ] = None,
+    ) -> None:
+        await service.delete_comment(slug, comment_id, current_user, delete_token)
 
     @delete("/{slug:str}", summary="Delete a share", status_code=204)
     async def delete_share(

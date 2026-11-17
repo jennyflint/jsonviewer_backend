@@ -114,7 +114,12 @@ All paths are prefixed with `/api`. Bodies are JSON; timestamps are ISO-8601 UTC
 | `GET /health` | – | `{"status","db","version"}`; `503` if the DB is down |
 | `POST /fetch` | – | Fetch a remote URL (SSRF-protected); returns raw text |
 | `POST /shares` | – | Create a share (`single` / `compare`) |
-| `GET /shares/{slug}` | – | Read a share (increments `view_count`) |
+| `GET /shares/{slug}` | – | Read a share (increments `view_count`). `403 share_locked` for password-protected / one-time shares |
+| `GET /shares/{slug}/meta` | – | Describe a share (title, kind, `password_protected`, `burn_after_read`, `comments_enabled`) **without** counting a view or burning it (safe for link previews) |
+| `POST /shares/{slug}/open` | – | Read a locked share: body `{password?}`. Wrong / missing password → `403 invalid_password` / `password_required`. A `burn_after_read` share is **deleted by this call** (atomically: a second reader gets `404`) |
+| `GET /shares/{slug}/comments` | – (`X-Share-Password` if protected) | List comments |
+| `POST /shares/{slug}/comments` | – (`X-Share-Password` if protected) | Add a comment `{text ≤ 2000, author ≤ 60, path?}`; `403 comments_disabled` unless the share was created with `comments_enabled`; max 200 per share |
+| `DELETE /shares/{slug}/comments/{id}` | owner or `X-Delete-Token` | Delete a comment |
 | `DELETE /shares/{slug}` | owner or `X-Delete-Token` | Delete a share |
 | `GET /shares` | required | My shares (`limit` ≤ 100 default 20, `offset`; returns `{items,total,limit,offset}`) |
 | `GET /auth/providers` | – | Enabled OAuth providers |
@@ -203,6 +208,8 @@ between replicas.
 ### Behaviour worth knowing
 
 - `POST /shares` has `save_to_history` (default `false`); it only has an effect for authenticated users.
+- `POST /shares` also takes `password` (4–128 chars, stored as a salted scrypt hash, never returned), `burn_after_read` (one-time link) and `comments_enabled` (default `false`). Password checks go through `POST` routes, so they share the 30/hour per-IP `shares` rate limit. Comments are deleted with their share.
+- Defaults: `MAX_DOCUMENT_BYTES` and `MAX_FETCH_BYTES` are 15 MB; the request body limit is `max(MAX_FETCH_BYTES, 2 × MAX_DOCUMENT_BYTES) + 1 MB`.
 - Duplicate analysis follows `JSON.parse` semantics: for a duplicated key the **last** value is effective, and only
   effective values take part in the value / subtree analysis. Numbers compare by value (`1.0 == 1`) and the original
   lexemes are returned in `lexemes`. `stats.depth` is the container nesting depth. At most 1000 paths are listed per group.

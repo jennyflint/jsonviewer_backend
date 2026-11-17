@@ -111,3 +111,21 @@ def oauth_cookie(settings: Settings, payload: dict[str, Any]) -> Cookie:
 
 def clear_cookie(response: Response[Any], key: str, path: str = "/") -> None:
     response.delete_cookie(key, path=path)
+
+
+def hash_password(password: str) -> str:
+    """scrypt with a random salt: ``scrypt$<salt hex>$<hash hex>``."""
+    salt = secrets.token_bytes(16)
+    digest = hashlib.scrypt(password.encode(), salt=salt, n=2**14, r=8, p=1, dklen=32)
+    return f"scrypt${salt.hex()}${digest.hex()}"
+
+
+def verify_password(password: str, stored: str) -> bool:
+    try:
+        _, salt_hex, hash_hex = stored.split("$")
+        digest = hashlib.scrypt(
+            password.encode(), salt=bytes.fromhex(salt_hex), n=2**14, r=8, p=1, dklen=32
+        )
+    except ValueError:
+        return False
+    return hmac.compare_digest(digest.hex(), hash_hex)

@@ -41,8 +41,8 @@ class Settings(BaseSettings):
     cookie_secure: bool = False
 
     # Limits
-    max_document_bytes: int = 5_242_880
-    max_fetch_bytes: int = 10_485_760
+    max_document_bytes: int = 15_728_640
+    max_fetch_bytes: int = 15_728_640
     fetch_timeout_seconds: float = 10
     fetch_max_redirects: int = 3
     history_max_entries_per_user: int = 500
